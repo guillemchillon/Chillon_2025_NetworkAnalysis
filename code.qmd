@@ -1,0 +1,321 @@
+---
+title: "code"
+author: "Guillem Chillon"
+date: "`r Sys.Date()`"
+format: pdf
+editor: visual
+---
+
+# Project 2
+
+## Import packages
+
+```{r}
+library(tidyverse)
+library(biomaRt)
+library(tximport)
+library(DESeq2)
+library(vsn)
+library(pheatmap)
+library(gridExtra)
+library(igraph)
+library(rstatix)
+library(ggpubr)
+```
+
+## Import data and experimental design
+
+### Load sample data
+
+```{r}
+samples <- read.csv("../data/exp_design.csv", header=TRUE)
+# Change rownames to reflect experimental information
+rownames(samples) <- factor(paste0(
+  samples$Experimental_ID, sep="_", 
+  samples$Genotype, sep="_",
+  samples$Treatment))
+# Remove miCtrl treated sample from this analysis
+samples <- samples[-c(9),]
+```
+
+### Import abundance files
+
+```{r}
+ensembl <- useEnsembl(biomart = "genes",
+                      dataset = "mmusculus_gene_ensembl")
+Tx <- getBM(attributes = c("ensembl_transcript_id", 
+                             "external_gene_name"),
+            mart = ensembl)
+
+colnames(Tx) <- c("tx_id", "gene_name")
+
+files <- file.path("../data/KALLISTO", 
+                   paste0(samples$Sample, "_quant"), "abundance.h5")
+file.exists(files)
+
+# Add labels to files
+IDs <- paste0(samples$Experimental_ID, sep="_", 
+              samples$Genotype, sep="_",
+              samples$Treatment)
+names(files) <- IDs
+
+# Import Kallisto transcript counts
+Txi_gene <- tximport(files, 
+                     type = "kallisto", 
+                     tx2gene = Tx,
+                     txOut = FALSE,
+                     ignoreTxVersion = TRUE)
+
+names(Txi_gene)
+head(Txi_gene$counts)
+```
+
+## Make DESeq2 DataSet
+
+```{r}
+samples$Litter <- as.character(samples$Litter)
+samples$RNA_batch <- as.character(samples$RNA_batch)
+
+dds <- DESeqDataSetFromTximport(txi = Txi_gene,
+                                colData = samples,
+                                design = ~ Genotype + Treatment + Litter)
+
+dds
+nrow(dds)
+# at least 4 samples with a count of 10 or higher
+keep <- rowSums(counts(dds) >= 10)>=4
+dds <- dds[keep,]
+nrow(dds)
+
+```
+
+### Transformation, sample clustering and visualization
+
+```{r}
+vsd <- vst(dds, blind=TRUE)
+meanSdPlot(assay(vsd))
+```
+
+```{r}
+dds <- estimateSizeFactors(dds)
+select <- order(rowMeans(counts(dds,normalized=TRUE)),
+                decreasing=TRUE)[1:20]
+df <- as.data.frame(colData(dds)[,c("Genotype","Treatment")])
+pheatmap(assay(vsd)[select,], cluster_rows=TRUE, show_rownames=TRUE,
+         cluster_cols=TRUE, annotation_col=df)
+```
+
+```{r}
+pcaData <- plotPCA(vsd, intgroup=c("Treatment", "Genotype", "Litter"), 
+                    returnData=TRUE, ntop=1000)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+p1 <- ggplot(pcaData, aes(PC1, PC2, color=Genotype, shape=Treatment)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed() +
+  theme_bw() +
+  ggtitle("PCA: Genotype ~ Treatment \nVST")
+
+p2 <- ggplot(pcaData, aes(PC1, PC2, color=Genotype, shape=Litter)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed() +
+  theme_bw() +
+  ggtitle("PCA: Litter ~ Litter \nVST")
+
+g <- grid.arrange(p1, p2, ncol=2)
+
+```
+
+# Network analysis
+
+## Create adjacent matrices
+
+### Select top 200 variable genes
+
+```{r}
+# Extract gene variance
+vsd_mat <- assay(vsd)
+gene_var <- apply(vsd_mat, 1, var)
+
+# Get the names of the top 200 most variable genes
+top200_genes <- names(sort(gene_var, decreasing = TRUE))[1:200]
+
+# Subset the vsd matrix to include only the top 200 variable genes
+vsd_top200 <- vsd_mat[top200_genes, ]
+
+```
+
+### Define adaptive threshold
+
+```{r}
+n_genes <- 200
+potential_edges <- (n_genes * (n_genes - 1)) / 2
+edges_keep <- round(0.05 * potential_edges) # Keep top 5% of edges
+```
+
+### Define bootstrap iteration
+
+```{r}
+set.seed(123)
+bootstrap_q <- function(sample_names, vsd, n_edges) {
+  # Resample 5 samples with replacement
+  samples_boot <- sample(sample_names, 5, replace = TRUE)
+  
+  # Create correlation matrix
+  cor_mat <- cor(t(vsd[, samples_boot]), 
+                 method = "spearman",
+                 use = "pairwise.complete.obs")
+  # Remove NA values
+  cor_mat[is.na(cor_mat)] <- 0
+  # Get unique corr values
+  cor_values <- abs(cor_mat[upper.tri(cor_mat)])
+  # Sort them in decreasing order
+  cor_values_sorted <- sort(cor_values, decreasing = TRUE)
+  # Apply threshold
+  threshold <- cor_values_sorted[n_edges]
+  adj_mat <- (abs(cor_mat) >= threshold) * 1
+  # Remove self-loops
+  diag(adj_mat) <- 0
+  
+  # Build igraph object
+  g <- graph_from_adjacency_matrix(adj_mat, mode = "undirected", diag = FALSE)
+  V(g)$name <- rownames(adj_mat)
+  
+  # Perform modularity maximization
+  if (gsize(g) > 0) {
+    mod_result <- cluster_louvain(g)
+    return(modularity(mod_result))
+  } else {
+    mod_result <- NA
+  }
+}
+```
+
+```{r}
+n_bootstrap <- 300
+
+samples <- samples %>% mutate(condition = paste0(Genotype, "_", Treatment))
+sample_list <- list(
+  WT = rownames(samples %>% filter(condition == "WT_VSB")),
+  VSB = rownames(samples %>% filter(condition == "MUT_VSB")),
+  Tx = rownames(samples %>% filter(condition == "MUT_V1"))
+)
+
+q_scores <- suppressWarnings(lapply(sample_list, function(sample_names) {
+  # Use replicate to perform bootstrap iterations
+  replicate(n_bootstrap, {
+    bootstrap_q(sample_names, vsd_top200, edges_keep)
+  })
+}))
+```
+
+```{r}
+lapply(q_scores, summary)
+# Check statistical significant
+df <- as.data.frame(q_scores) %>% pivot_longer(
+  cols=everything(),
+  names_to = "condition",
+  values_to = "q_score"
+) %>% 
+  mutate(condition = factor(condition, levels=c("WT", "VSB", "Tx")))
+
+wilcox <- df %>% 
+  wilcox_test(q_score ~ condition, p.adjust.method="bonferroni")  %>% 
+  add_xy_position(x = "condition", step.increase = 4)
+wilcox
+
+```
+
+```{r}
+p <- ggplot(df, aes(x=condition, y=q_score, fill=condition)) +
+  geom_violin() +
+  geom_boxplot(width=0.1, fill="white", outlier.shape = NA) +
+  stat_pvalue_manual(
+    wilcox, label = "p.adj.signif", tip.length = 0.01
+  ) +
+  labs(
+    title = "Bootstrap modularity Q scores",
+    x = "Condition",
+    y = "Modularity (Q)"
+  )
+p
+```
+
+## Create modularity maps
+
+### Define function to build network and modules
+
+```{r}
+build_network_and_modules <- function(sample_names, vsd_data, n_edges) {
+  # Create correlation matrix
+  cor_mat <- cor(t(vsd_data[, sample_names]), 
+                 method = "spearman",
+                 use = "pairwise.complete.obs")
+  cor_mat[is.na(cor_mat)] <- 0 # Handle NAs
+  
+  # Apply adaptive threshold
+  cor_values <- abs(cor_mat[upper.tri(cor_mat)])
+  cor_values_sorted <- sort(cor_values, decreasing = TRUE)
+  threshold <- cor_values_sorted[n_edges]
+
+  adj_mat <- (abs(cor_mat) >= threshold) * 1
+  diag(adj_mat) <- 0
+  
+  # Build igraph object
+  g <- graph_from_adjacency_matrix(adj_mat, mode = "undirected", diag = FALSE)
+  V(g)$name <- rownames(adj_mat)
+  
+  # Perform modularity maximization
+  if (gsize(g) > 0) {
+    modules <- cluster_louvain(g)
+  } else {
+    modules <- list(membership = rep(1, vcount(g)), modularity = NA) 
+    class(modules) <- "communities"
+  } # Return both parts
+  return(list(graph = g, modules = modules))
+}
+```
+
+### Build igraph objects and modularity results
+
+```{r}
+original_network_results <- suppressWarnings(lapply(sample_list, function(names) {
+  build_network_and_modules(names, vsd_top200, edges_keep) # edges_keep defined earlier
+}))
+igraph_objects <- lapply(original_network_results, function(res) res$graph)
+modularity_results <- lapply(original_network_results, function(res) res$modules)
+```
+
+### Plot modularity clusters
+
+```{r}
+conditions=c("WT", "VSB", "Tx")
+par(mfrow=c(1,3), mar=c(1,1,2,1))
+for (i in 1:length(conditions)) {
+  cond <- conditions[i]
+  g <- igraph_objects[[cond]]
+  modules <- modularity_results[[cond]]
+  
+  V(g)$color <- membership(modules)
+  l <- layout_with_fr(g)
+  
+  plot(
+    g,
+    layout = l,
+    vertex.size = 5,
+    vertex.label = NA,
+    main = paste0(cond, " Modularity Clusters")
+  )
+}
+par(mfrow=c(1,1))
+```
+
+## Save session info
+
+```{r}
+sessionInfo()
+```
