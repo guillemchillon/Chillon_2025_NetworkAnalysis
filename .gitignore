@@ -1,5 +1,6 @@
 # Ignore exta folders
 papers
+files
 
 # Ignore R/RStudio specific files
 *.Rhistory
