@@ -1,0 +1,15 @@
+# Ignore exta folders
+literature
+
+# Ignore R/RStudio specific files
+*.Rhistory
+*.RData
+.Rproj.user
+*.RDataTmp
+
+# Ignore system files
+.DS_Store
+.Rsubread*
+
+# Ignore illustrator files
+*.ai
